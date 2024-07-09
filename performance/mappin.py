@@ -2,6 +2,22 @@ import os
 import bsdiff4
 import time
 import mmap
+import tracemalloc
+
+
+def start_memory_tracing():
+    tracemalloc.start()
+
+def stop_memory_tracing():
+    snapshot = tracemalloc.take_snapshot()
+    top_stats = snapshot.statistics('lineno')
+
+    print("[ Top 10 memory usage ]")
+    for stat in top_stats[:10]:
+        print(stat)
+
+    tracemalloc.stop()
+
 
 def create_patch_mmap(old_file, new_file, patch_file):
     with open(old_file, 'rb') as old_f, open(new_file, 'rb') as new_f:
@@ -78,14 +94,21 @@ for i, size in enumerate(sizes):
     patch_file = f'file_{i}.patch'
     new_file_recreated = f'new_file_recreated_{i}.bin'
     
+    start_memory_tracing()
+    
     # Measure patch creation
     creation_time = create_patch_mmap(old_file, new_file, patch_file)
+    stop_memory_tracing()
     print(f"Patch creation for {size//(1024*1024)}MB files took {creation_time:.2f} seconds.")
     
+    start_memory_tracing()
+
     # Measure patch application
     application_time = apply_patch_mmap(old_file, patch_file, new_file_recreated)
+    stop_memory_tracing()
     print(f"Patch application for {size//(1024*1024)}MB files took {application_time:.2f} seconds.")
     
+
     # Verify patched files
     if files_are_identical_mmap(new_file, new_file_recreated):
         print(f"The files for {size//(1024*1024)}MB are identical.")

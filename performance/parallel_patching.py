@@ -2,6 +2,7 @@ import bsdiff4
 import os
 import concurrent.futures
 import time
+import tracemalloc  # Import tracemalloc module
 
 # Function to create a patch
 def create_patch(old_file, new_file, patch_file):
@@ -70,25 +71,49 @@ def parallel_file_verification(file_pairs):
                 print(f"Error occurred: {e}")
         return results
 
+# Function to start memory tracing
+def start_memory_tracing():
+    tracemalloc.start()
+
+# Function to stop memory tracing and print current memory usage
+def stop_memory_tracing():
+    snapshot = tracemalloc.take_snapshot()
+    top_stats = snapshot.statistics('lineno')
+
+    print("[ Top 10 memory usage ]")
+    for stat in top_stats[:10]:
+        print(stat)
+
+    tracemalloc.stop()
+
 # Measure performance for creating patches in parallel
 def create_patches_parallel(file_pairs):
+    start_memory_tracing()
     start_time = time.time()
     parallel_patch_creation(file_pairs)
     end_time = time.time()
+    stop_memory_tracing()
+
     print(f"Parallel patch creation took {end_time - start_time:.2f} seconds.")
 
 # Measure performance for applying patches in parallel
 def apply_patches_parallel(file_pairs):
+    start_memory_tracing()
     start_time = time.time()
     parallel_patch_application(file_pairs)
     end_time = time.time()
+    stop_memory_tracing()
+
     print(f"Parallel patch application took {end_time - start_time:.2f} seconds.")
 
 # Measure performance for verifying files in parallel
 def verify_patches_parallel(file_pairs):
+    start_memory_tracing()
     start_time = time.time()
     verification_results = parallel_file_verification(file_pairs)
     end_time = time.time()
+    stop_memory_tracing()
+
     print(f"Parallel file verification took {end_time - start_time:.2f} seconds.")
     
     for i, result in enumerate(verification_results):
