@@ -71,7 +71,7 @@ def files_are_identical_mmap(file1, file2):
     return True
 
 # File sizes to test
-sizes = [1 * 1024 * 1024, 10 * 1024 * 1024, 50 * 1024 * 1024]
+sizes = [0.246, 1, 10, 50]  # Sizes in MB
 
 # Measure performance and patch size for each test file
 for i, size in enumerate(sizes):
@@ -80,19 +80,19 @@ for i, size in enumerate(sizes):
     patch_file = f'file_{i}.patch'
     new_file_recreated = f'new_file_recreated_{i}.bin'
     
-    print(f"\nProcessing {size // (1024 * 1024)}MB files:")
+    print(f"\nProcessing {size:.2f} MB files:")
     
     # Measure patch creation
     creation_time, patch_size = create_patch_mmap(old_file, new_file, patch_file)
-    print(f"Patch creation for {size // (1024 * 1024)}MB files took {creation_time:.2f} seconds.")
+    print(f"Patch creation for {size:.2f} MB files took {creation_time:.2f} seconds.")
     print(f"Patch size: {patch_size:.2f} MB")
     
     # Measure patch application
     application_time = apply_patch_mmap(old_file, patch_file, new_file_recreated)
-    print(f"Patch application for {size // (1024 * 1024)}MB files took {application_time:.2f} seconds.")
+    print(f"Patch application for {size:.2f} MB files took {application_time:.2f} seconds.")
     
     # Verify patched files
     if files_are_identical_mmap(new_file, new_file_recreated):
-        print(f"The files for {size // (1024 * 1024)}MB are identical.")
+        print(f"The files for {size:.2f} MB are identical.")
     else:
-        print(f"The files for {size // (1024 * 1024)}MB are different.")
+        print(f"The files for {size:.2f} MB are different.")
