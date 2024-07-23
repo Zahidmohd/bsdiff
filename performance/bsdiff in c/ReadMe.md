@@ -13,22 +13,20 @@ These libraries are modified to eliminate external dependencies and provide a si
 
 ## Directory Structure
 
-project/
-│
-├── src/
-│   ├── bsdiff.c
-│   ├── bspatch.c
-│   ├── main.c
-│
-├── include/
-│   ├── bsdiff.h
-│   ├── bspatch.h
-│
-├── build/
-│
-├── Makefile
-│
-└── README.md
+- project/
+  - ├── src/
+     - ├── bsdiff.c
+     - ├── bspatch.c
+     -  └── main.c
+   - ├── include/
+      -  ├── bsdiff.h
+      - └── bspatch.h
+   - ├── build/
+   - ├── Makefile
+   - ├── old_file_0.bin
+   - ├── new_file_0.bin
+   - └── README.md
+
 
 ## Building the Project
 
