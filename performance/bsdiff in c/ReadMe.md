@@ -49,12 +49,12 @@ If you don't have `make` installed, you can manually compile the project using g
    mkdir build
 
 3. Compile the source files:
-   gcc -std=c99 -Wall -Iinclude -c src/main.c -o build/main.o
-   gcc -std=c99 -Wall -Iinclude -c src/bsdiff.c -o build/bsdiff.o
-   gcc -std=c99 -Wall -Iinclude -c src/bspatch.c -o build/bspatch.o
+   - `gcc -std=c99 -Wall -Iinclude -c src/main.c -o build/main.o`
+   - `gcc -std=c99 -Wall -Iinclude -c src/bsdiff.c -o build/bsdiff.o`
+   - `gcc -std=c99 -Wall -Iinclude -c src/bspatch.c -o build/bspatch.o`
 
 4. Link the object files to create the executable:
-   gcc -std=c99 -Wall -Iinclude -o build/myprogram build/main.o build/bsdiff.o build/bspatch.o
+   `gcc -std=c99 -Wall -Iinclude -o build/myprogram build/main.o build/bsdiff.o build/bspatch.o`
 
 ## Running the Program
 
@@ -67,11 +67,11 @@ The program expects four arguments:
 
 To run the program, use the following command:
 
-./build/myprogram oldfile newfile patchfile patchedfile
+`./build/myprogram oldfile newfile patchfile patchedfile`
 
 ### Example
 
-./build/myprogram old_file_0.bin new_file_0.bin file_0.patch patched_file_0.bin
+`./build/myprogram old_file_0.bin new_file_0.bin file_0.patch patched_file_0.bin`
 
 This command will:
 1. Create a patch (`file_0.patch`) from `old_file_0.bin` and `new_file_0.bin`.
