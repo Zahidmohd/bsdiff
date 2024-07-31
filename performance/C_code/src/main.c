@@ -1,241 +1,252 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdint.h>
 #include <string.h>
-#include <bzlib.h>
 #include "bsdiff.h"
-#include "bspatch.h"
+#include "bsdiff_private.h"
+#include <bzlib.h>
 
-// Define the callback functions for bsdiff
-void* my_malloc(size_t size) {
-    return malloc(size);
+static void log_error(void *opaque, const char *errmsg)
+{
+    (void)opaque;
+    fprintf(stderr, "%s", errmsg);
 }
 
-void my_free(void* ptr) {
-    free(ptr);
+// Function to initialize BZip2 compressor
+static int bz2_compressor_init(void *state, struct bsdiff_stream *stream)
+{
+    struct bz2_compressor *enc = (struct bz2_compressor*)state;
+
+    if (enc->initialized)
+        return BSDIFF_ERROR;
+
+    if (stream->read != NULL || stream->write == NULL || stream->flush == NULL)
+        return BSDIFF_INVALID_ARG;
+    enc->strm = stream;
+
+    enc->bzstrm.bzalloc = NULL;
+    enc->bzstrm.bzfree = NULL;
+    enc->bzstrm.opaque = NULL;
+    if (BZ2_bzCompressInit(&(enc->bzstrm), 9, 0, 30) != BZ_OK)
+        return BSDIFF_ERROR;
+    enc->bzstrm.avail_in = 0;
+    enc->bzstrm.next_in = NULL;
+    enc->bzstrm.avail_out = (unsigned int)(sizeof(enc->buf));
+    enc->bzstrm.next_out = enc->buf;
+
+    enc->bzerr = BZ_OK;
+
+    enc->initialized = 1;
+
+    return BSDIFF_SUCCESS;
 }
 
-int my_write(struct bsdiff_stream* stream, const void* buffer, int size) {
-    FILE* f = (FILE*)stream->opaque;
-    return fwrite(buffer, 1, size, f) == size ? 0 : -1;
-}
+// Function to write data using BZip2 compressor
+static int bz2_compressor_write(void *state, const void *buffer, size_t size)
+{
+    struct bz2_compressor *enc = (struct bz2_compressor*)state;
+    
+    if (!enc->initialized)
+        return BSDIFF_ERROR;
+    if (enc->bzerr != BZ_OK && enc->bzerr != BZ_RUN_OK)
+        return BSDIFF_ERROR;
+    if (size >= UINT32_MAX)
+        return BSDIFF_INVALID_ARG;
+    if (size == 0)
+        return BSDIFF_SUCCESS;
 
-// Define the callback function for bspatch
-int my_read(const struct bspatch_stream* stream, void* buffer, int length) {
-    FILE* f = (FILE*)stream->opaque;
-    return fread(buffer, 1, length, f) == length ? 0 : -1;
-}
+    enc->bzstrm.avail_in = (unsigned int)size;
+    enc->bzstrm.next_in = (char*)buffer;
 
-// Helper function to read a file into a buffer
-uint8_t* read_file(const char* path, int64_t* size) {
-    FILE* f = fopen(path, "rb");
-    if (!f) return NULL;
+    while (1) {
+        enc->bzerr = BZ2_bzCompress(&(enc->bzstrm), BZ_RUN);
+        if (enc->bzerr != BZ_RUN_OK)
+            return BSDIFF_ERROR;
 
-    fseek(f, 0, SEEK_END);
-    *size = ftell(f);
-    fseek(f, 0, SEEK_SET);
+        if (enc->bzstrm.avail_out == 0) {
+            if (enc->strm->write(enc->strm->state, enc->buf, sizeof(enc->buf)) != BSDIFF_SUCCESS)
+                return BSDIFF_ERROR;
+            enc->bzstrm.next_out = enc->buf;
+            enc->bzstrm.avail_out = (unsigned int)(sizeof(enc->buf));
+        }
 
-    uint8_t* buffer = malloc(*size);
-    if (!buffer) {
-        fclose(f);
-        return NULL;
+        if (enc->bzstrm.avail_in == 0)
+            return BSDIFF_SUCCESS;
     }
 
-    fread(buffer, 1, *size, f);
-    fclose(f);
-
-    return buffer;
+    return BSDIFF_ERROR;
 }
 
-// Helper function to write a buffer to a file
-int write_file(const char* path, const uint8_t* buffer, int64_t size) {
-    FILE* f = fopen(path, "wb");
-    if (!f) return -1;
+// Function to flush BZip2 compressor
+static int bz2_compressor_flush(void *state)
+{
+    struct bz2_compressor *enc = (struct bz2_compressor*)state;
+    size_t cb;
 
-    if (fwrite(buffer, 1, size, f) != size) {
-        fclose(f);
-        return -1;
+    if (!enc->initialized)
+        return BSDIFF_ERROR;
+    if (enc->bzerr != BZ_OK && enc->bzerr != BZ_RUN_OK)
+        return BSDIFF_ERROR;
+
+    while (1) {
+        enc->bzerr = BZ2_bzCompress(&(enc->bzstrm), BZ_FINISH);
+        if (enc->bzerr != BZ_FINISH_OK && enc->bzerr != BZ_STREAM_END)
+            return BSDIFF_ERROR;
+
+        if (enc->bzstrm.avail_out < (unsigned int)(sizeof(enc->buf))) {
+            cb = sizeof(enc->buf) - enc->bzstrm.avail_out;
+            if (enc->strm->write(enc->strm->state, enc->buf, cb) != BSDIFF_SUCCESS)
+                return BSDIFF_ERROR;
+            enc->bzstrm.avail_out = (unsigned int)(sizeof(enc->buf));
+            enc->bzstrm.next_out = enc->buf;
+        }
+
+        if (enc->bzerr == BZ_STREAM_END) {
+            if (enc->strm->flush(enc->strm->state) != BSDIFF_SUCCESS)
+                return BSDIFF_ERROR;
+            return BSDIFF_SUCCESS;
+        }
     }
 
-    fclose(f);
-    return 0;
+    return BSDIFF_ERROR;
 }
 
-// Helper function to compress a buffer using BZip2
-int compress_bzip2(const uint8_t* input, int64_t input_size, uint8_t** output, int64_t* output_size) {
-    unsigned int dest_len = input_size + (input_size / 100) + 600; // BZip2 recommendation
-    *output = malloc(dest_len);
-    if (!*output) return -1;
+// Function to close BZip2 compressor
+static void bz2_compressor_close(void *state)
+{
+    struct bz2_compressor *enc = (struct bz2_compressor*)state;
 
-    int result = BZ2_bzBuffToBuffCompress((char*)*output, &dest_len, (char*)input, input_size, 9, 0, 0);
-    if (result != BZ_OK) {
-        free(*output);
-        return -1;
+    if (enc->initialized) {
+        BZ2_bzCompressEnd(&(enc->bzstrm));
     }
 
-    *output_size = dest_len;
-    return 0;
+    free(enc);
 }
 
-// Helper function to decompress a buffer using BZip2
-int decompress_bzip2(const uint8_t* input, int64_t input_size, uint8_t** output, int64_t output_size) {
-    *output = malloc(output_size);
-    if (!*output) return -1;
+// Function to create BZip2 compressor
+int bsdiff_create_bz2_compressor(struct bsdiff_compressor *enc)
+{
+    struct bz2_compressor *state;
 
-    unsigned int dest_len = output_size;
-    int result = BZ2_bzBuffToBuffDecompress((char*)*output, &dest_len, (char*)input, input_size, 0, 0);
-    if (result != BZ_OK) {
-        free(*output);
-        return -1;
+    state = malloc(sizeof(struct bz2_compressor));
+    if (!state)
+        return BSDIFF_OUT_OF_MEMORY;
+    state->initialized = 0;
+    state->strm = NULL;
+
+    memset(enc, 0, sizeof(*enc));
+    enc->state = state;
+    enc->init = bz2_compressor_init;
+    enc->write = bz2_compressor_write;
+    enc->flush = bz2_compressor_flush;
+    enc->close = bz2_compressor_close;
+
+    return BSDIFF_SUCCESS;
+}
+
+int generate_patch(const char *oldname, const char *newname, const char *patchname)
+{
+    int ret = 1;
+    struct bsdiff_stream oldfile = { 0 }, newfile = { 0 }, patchfile = { 0 };
+    struct bsdiff_ctx ctx = { 0 };
+    struct bsdiff_compressor compressor = { 0 };
+
+    ret = bsdiff_open_file_stream(BSDIFF_MODE_READ, oldname, &oldfile);
+    if (ret != BSDIFF_SUCCESS) {
+        fprintf(stderr, "can't open oldfile: %s\n", oldname);
+        goto cleanup;
+    }
+    ret = bsdiff_open_file_stream(BSDIFF_MODE_READ, newname, &newfile);
+    if (ret != BSDIFF_SUCCESS) {
+        fprintf(stderr, "can't open newfile: %s\n", newname);
+        goto cleanup;
+    }
+    ret = bsdiff_open_file_stream(BSDIFF_MODE_WRITE, patchname, &patchfile);
+    if (ret != BSDIFF_SUCCESS) {
+        fprintf(stderr, "can't open patchfile: %s\n", patchname);
+        goto cleanup;
+    }
+    ret = bsdiff_create_bz2_compressor(&compressor);
+    if (ret != BSDIFF_SUCCESS) {
+        fprintf(stderr, "can't create BZ2 compressor\n");
+        goto cleanup;
     }
 
-    return 0;
+    ctx.log_error = log_error;
+
+    ret = bsdiff(&ctx, &oldfile, &newfile, &compressor);
+    if (ret != BSDIFF_SUCCESS) {
+        fprintf(stderr, "bsdiff failed: %d\n", ret);
+        goto cleanup;
+    }
+
+cleanup:
+    compressor.close(compressor.state);
+    bsdiff_close_stream(&patchfile);
+    bsdiff_close_stream(&newfile);
+    bsdiff_close_stream(&oldfile);
+
+    return ret;
 }
 
-int main(int argc, char* argv[]) {
+int apply_patch(const char *oldname, const char *newname, const char *patchname)
+{
+    int ret = 1;
+    struct bsdiff_stream oldfile = { 0 }, newfile = { 0 }, patchfile = { 0 };
+    struct bsdiff_ctx ctx = { 0 };
+    struct bsdiff_compressor compressor = { 0 };
+
+    ret = bsdiff_open_file_stream(BSDIFF_MODE_READ, oldname, &oldfile);
+    if (ret != BSDIFF_SUCCESS) {
+        fprintf(stderr, "can't open oldfile: %s\n", oldname);
+        goto cleanup;
+    }
+    ret = bsdiff_open_file_stream(BSDIFF_MODE_WRITE, newname, &newfile);
+    if (ret != BSDIFF_SUCCESS) {
+        fprintf(stderr, "can't open newfile: %s\n", newname);
+        goto cleanup;
+    }
+    ret = bsdiff_open_file_stream(BSDIFF_MODE_READ, patchname, &patchfile);
+    if (ret != BSDIFF_SUCCESS) {
+        fprintf(stderr, "can't open patchfile: %s\n", patchname);
+        goto cleanup;
+    }
+    ret = bsdiff_create_bz2_compressor(&compressor);
+    if (ret != BSDIFF_SUCCESS) {
+        fprintf(stderr, "can't create BZ2 compressor\n");
+        goto cleanup;
+    }
+
+    ctx.log_error = log_error;
+
+    ret = bspatch(&ctx, &oldfile, &newfile, &compressor);
+    if (ret != BSDIFF_SUCCESS) {
+        fprintf(stderr, "bspatch failed: %d\n", ret);
+        goto cleanup;
+    }
+
+cleanup:
+    compressor.close(compressor.state);
+    bsdiff_close_stream(&patchfile);
+    bsdiff_close_stream(&newfile);
+    bsdiff_close_stream(&oldfile);
+
+    return ret;
+}
+
+int main(int argc, char *argv[])
+{
     if (argc != 5) {
-        fprintf(stderr, "Usage: %s oldfile newfile patchfile patchedfile\n", argv[0]);
+        fprintf(stderr, "Usage: %s <oldfile> <newfile> <patchfile> <mode>\n", argv[0]);
+        fprintf(stderr, "mode: 'generate' or 'apply'\n");
         return 1;
     }
 
-    const char* oldfile = argv[1];
-    const char* newfile = argv[2];
-    const char* patchfile = argv[3];
-    const char* patchedfile = argv[4];
-
-    // Read the old and new files
-    int64_t oldsize, newsize;
-    uint8_t* olddata = read_file(oldfile, &oldsize);
-    uint8_t* newdata = read_file(newfile, &newsize);
-
-    if (!olddata || !newdata) {
-        fprintf(stderr, "Failed to read files\n");
-        free(olddata);
-        free(newdata);
+    if (strcmp(argv[4], "generate") == 0) {
+        return generate_patch(argv[1], argv[2], argv[3]);
+    } else if (strcmp(argv[4], "apply") == 0) {
+        return apply_patch(argv[1], argv[2], argv[3]);
+    } else {
+        fprintf(stderr, "Invalid mode: %s\n", argv[4]);
         return 1;
     }
-
-    // Create the patch
-    FILE* pf = fopen(patchfile, "wb");
-    if (!pf) {
-        fprintf(stderr, "Failed to open patch file for writing\n");
-        free(olddata);
-        free(newdata);
-        return 1;
-    }
-
-    struct bsdiff_stream bsdiff_stream = { pf, my_malloc, my_free, my_write };
-    if (bsdiff(olddata, oldsize, newdata, newsize, &bsdiff_stream) != 0) {
-        fprintf(stderr, "Failed to create patch\n");
-        fclose(pf);
-        free(olddata);
-        free(newdata);
-        return 1;
-    }
-    fclose(pf);
-
-    // Read the patch file into a buffer
-    int64_t patch_size;
-    uint8_t* patch_data = read_file(patchfile, &patch_size);
-    if (!patch_data) {
-        fprintf(stderr, "Failed to read patch file\n");
-        free(olddata);
-        free(newdata);
-        return 1;
-    }
-
-    // Compress the patch data
-    uint8_t* compressed_patch_data;
-    int64_t compressed_patch_size;
-    if (compress_bzip2(patch_data, patch_size, &compressed_patch_data, &compressed_patch_size) != 0) {
-        fprintf(stderr, "Failed to compress patch file\n");
-        free(olddata);
-        free(newdata);
-        free(patch_data);
-        return 1;
-    }
-
-    free(patch_data);
-
-    // Write the compressed patch data to the patch file
-    if (write_file(patchfile, compressed_patch_data, compressed_patch_size) != 0) {
-        fprintf(stderr, "Failed to write compressed patch file\n");
-        free(olddata);
-        free(newdata);
-        free(compressed_patch_data);
-        return 1;
-    }
-
-    free(compressed_patch_data);
-
-    // Apply the patch
-    pf = fopen(patchfile, "rb");
-    if (!pf) {
-        fprintf(stderr, "Failed to open patch file for reading\n");
-        free(olddata);
-        free(newdata);
-        return 1;
-    }
-
-    // Read the compressed patch file into a buffer
-    uint8_t* compressed_patch_data_read = read_file(patchfile, &compressed_patch_size);
-    if (!compressed_patch_data_read) {
-        fprintf(stderr, "Failed to read compressed patch file\n");
-        fclose(pf);
-        free(olddata);
-        free(newdata);
-        return 1;
-    }
-    fclose(pf);
-
-    // Decompress the patch data
-    uint8_t* decompressed_patch_data;
-    if (decompress_bzip2(compressed_patch_data_read, compressed_patch_size, &decompressed_patch_data, patch_size) != 0) {
-        fprintf(stderr, "Failed to decompress patch file\n");
-        free(olddata);
-        free(newdata);
-        free(compressed_patch_data_read);
-        return 1;
-    }
-
-    free(compressed_patch_data_read);
-
-    // Apply the decompressed patch
-    uint8_t* patcheddata = malloc(newsize);
-    if (!patcheddata) {
-        fprintf(stderr, "Failed to allocate memory for patched file\n");
-        free(olddata);
-        free(newdata);
-        free(decompressed_patch_data);
-        return 1;
-    }
-
-    struct bspatch_stream bspatch_stream = { decompressed_patch_data, my_read };
-    if (bspatch(olddata, oldsize, patcheddata, newsize, &bspatch_stream) != 0) {
-        fprintf(stderr, "Failed to apply patch\n");
-        free(olddata);
-        free(newdata);
-        free(decompressed_patch_data);
-        free(patcheddata);
-        return 1;
-    }
-
-    free(decompressed_patch_data);
-
-    // Write the patched file
-    if (write_file(patchedfile, patcheddata, newsize) != 0) {
-        fprintf(stderr, "Failed to write patched file\n");
-        free(olddata);
-        free(newdata);
-        free(patcheddata);
-        return 1;
-    }
-
-    // Clean up
-    free(olddata);
-    free(newdata);
-    free(patcheddata);
-
-    printf("Patch applied successfully\n");
-    return 0;
 }

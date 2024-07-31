@@ -1,6 +1,6 @@
 ﻿/*-
  * Copyright 2003-2005 Colin Percival
- * Copyright 2012 Matthew Endsley
+ * Copyright 2021 zhuyie
  * All rights reserved
  *
  * Redistribution and use in source and binary forms, with or without
@@ -12,7 +12,7 @@
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
  *
- * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ''AS IS'' AND ANY EXPRESS OR
  * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
  * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
  * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
@@ -25,170 +25,112 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <limits.h>
-#include "bspatch.h"
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+#include <stdint.h>
+#include <sys/types.h>
 
-static int64_t offtin(uint8_t *buf)
+#include "bsdiff.h"
+#include "bsdiff_private.h"
+
+int bspatch(
+	struct bsdiff_ctx *ctx,
+	struct bsdiff_stream *oldfile, 
+	struct bsdiff_stream *newfile,
+	struct bsdiff_patch_packer *packer)
 {
-	int64_t y;
-
-	y=buf[7]&0x7F;
-	y=y*256;y+=buf[6];
-	y=y*256;y+=buf[5];
-	y=y*256;y+=buf[4];
-	y=y*256;y+=buf[3];
-	y=y*256;y+=buf[2];
-	y=y*256;y+=buf[1];
-	y=y*256;y+=buf[0];
-
-	if(buf[7]&0x80) y=-y;
-
-	return y;
-}
-
-int bspatch(const uint8_t* old, int64_t oldsize, uint8_t* new, int64_t newsize, struct bspatch_stream* stream)
-{
-	uint8_t buf[8];
-	int64_t oldpos,newpos;
+	int ret;
+	size_t cb;
+	int64_t oldsize, newsize;
+	uint8_t *old = NULL, *new = NULL;
+	int64_t oldpos, newpos;
 	int64_t ctrl[3];
 	int64_t i;
 
-	oldpos=0;newpos=0;
-	while(newpos<newsize) {
+	assert(oldfile->get_mode(oldfile->state) == BSDIFF_MODE_READ);
+	assert(newfile->get_mode(newfile->state) == BSDIFF_MODE_WRITE);
+	assert(packer->get_mode(packer->state) == BSDIFF_MODE_READ);
+
+	if ((oldfile->seek(oldfile->state, 0, BSDIFF_SEEK_END) != BSDIFF_SUCCESS) ||
+		(oldfile->tell(oldfile->state, &oldsize) != BSDIFF_SUCCESS) ||
+		(oldfile->seek(oldfile->state, 0, BSDIFF_SEEK_SET) != BSDIFF_SUCCESS))
+	{
+		HANDLE_ERROR(BSDIFF_FILE_ERROR, "retrieve size of oldfile");
+	}
+	if (oldsize >= SIZE_MAX)
+		HANDLE_ERROR(BSDIFF_SIZE_TOO_LARGE, "oldfile is too large");
+	if ((old = malloc((size_t)(oldsize + 1))) == NULL)
+		HANDLE_ERROR(BSDIFF_OUT_OF_MEMORY, "malloc for old");
+	if (oldfile->read(oldfile->state, old, (size_t)oldsize, &cb) != BSDIFF_SUCCESS)
+		HANDLE_ERROR(BSDIFF_FILE_ERROR, "read oldfile");
+
+	if (packer->read_new_size(packer->state, &newsize) != BSDIFF_SUCCESS)
+		HANDLE_ERROR(BSDIFF_FILE_ERROR, "read new size from patch_packer");
+	if (newsize >= SIZE_MAX)
+		HANDLE_ERROR(BSDIFF_SIZE_TOO_LARGE, "newfile is too large");
+	if ((new = malloc((size_t)(newsize + 1))) == NULL)
+		HANDLE_ERROR(BSDIFF_OUT_OF_MEMORY, "malloc for new");
+
+	oldpos = 0; newpos = 0;
+	while (newpos < newsize) {
 		/* Read control data */
-		for(i=0;i<=2;i++) {
-			if (stream->read(stream, buf, 8))
-				return -1;
-			ctrl[i]=offtin(buf);
-		};
+		ret = packer->read_entry_header(packer->state, &ctrl[0], &ctrl[1], &ctrl[2]);
+		if (ret != BSDIFF_SUCCESS && ret != BSDIFF_END_OF_FILE)
+			HANDLE_ERROR(BSDIFF_FILE_ERROR, "read control data");
 
 		/* Sanity-check */
-		if (ctrl[0]<0 || ctrl[0]>INT_MAX ||
-			ctrl[1]<0 || ctrl[1]>INT_MAX ||
-			newpos+ctrl[0]>newsize)
-			return -1;
+		if ((ctrl[0] < 0) || (ctrl[1] < 0))
+			HANDLE_ERROR(BSDIFF_CORRUPT_PATCH, "invalid control data");
+		if (newpos + ctrl[0] > newsize)
+			HANDLE_ERROR(BSDIFF_CORRUPT_PATCH, "invalid control data");
 
 		/* Read diff string */
-		if (stream->read(stream, new + newpos, ctrl[0]))
-			return -1;
+		if (ctrl[0] >= SIZE_MAX)
+			HANDLE_ERROR(BSDIFF_SIZE_TOO_LARGE, "read diff string");
+		ret = packer->read_entry_diff(packer->state, new + newpos, (size_t)ctrl[0], &cb);
+		if ((ret != BSDIFF_SUCCESS && ret != BSDIFF_END_OF_FILE) || (cb != (size_t)ctrl[0]))
+			HANDLE_ERROR(BSDIFF_FILE_ERROR, "read diff string");
 
 		/* Add old data to diff string */
-		for(i=0;i<ctrl[0];i++)
-			if((oldpos+i>=0) && (oldpos+i<oldsize))
-				new[newpos+i]+=old[oldpos+i];
+		for (i = 0; i < ctrl[0]; i++) {
+			if ((oldpos + i >= 0) && (oldpos + i < oldsize))
+				new[newpos + i] += old[oldpos + i];
+		}
 
 		/* Adjust pointers */
-		newpos+=ctrl[0];
-		oldpos+=ctrl[0];
+		newpos += ctrl[0];
+		oldpos += ctrl[0];
 
 		/* Sanity-check */
-		if(newpos+ctrl[1]>newsize)
-			return -1;
+		if (newpos + ctrl[1] > newsize)
+			HANDLE_ERROR(BSDIFF_CORRUPT_PATCH, "invalid control data");
 
 		/* Read extra string */
-		if (stream->read(stream, new + newpos, ctrl[1]))
-			return -1;
+		if (ctrl[1] >= SIZE_MAX)
+			HANDLE_ERROR(BSDIFF_SIZE_TOO_LARGE, "read extra string");
+		ret = packer->read_entry_extra(packer->state, new + newpos, (size_t)ctrl[1], &cb);
+		if ((ret != BSDIFF_SUCCESS && ret != BSDIFF_END_OF_FILE) || (cb != (size_t)ctrl[1]))
+			HANDLE_ERROR(BSDIFF_FILE_ERROR, "read extra string");
 
 		/* Adjust pointers */
-		newpos+=ctrl[1];
-		oldpos+=ctrl[2];
+		newpos += ctrl[1];
+		oldpos += ctrl[2];
 	};
 
-	return 0;
-}
-
-#if defined(BSPATCH_EXECUTABLE)
-
-#include <bzlib.h>
-#include <stdlib.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <string.h>
-#include <err.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#include <fcntl.h>
-
-static int bz2_read(const struct bspatch_stream* stream, void* buffer, int length)
-{
-	int n;
-	int bz2err;
-	BZFILE* bz2;
-
-	bz2 = (BZFILE*)stream->opaque;
-	n = BZ2_bzRead(&bz2err, bz2, buffer, length);
-	if (n != length)
-		return -1;
-
-	return 0;
-}
-
-int main(int argc,char * argv[])
-{
-	FILE * f;
-	int fd;
-	int bz2err;
-	uint8_t header[24];
-	uint8_t *old, *new;
-	int64_t oldsize, newsize;
-	BZFILE* bz2;
-	struct bspatch_stream stream;
-	struct stat sb;
-
-	if(argc!=4) errx(1,"usage: %s oldfile newfile patchfile\n",argv[0]);
-
-	/* Open patch file */
-	if ((f = fopen(argv[3], "r")) == NULL)
-		err(1, "fopen(%s)", argv[3]);
-
-	/* Read header */
-	if (fread(header, 1, 24, f) != 24) {
-		if (feof(f))
-			errx(1, "Corrupt patch\n");
-		err(1, "fread(%s)", argv[3]);
+	/* Write the new file */
+	if ((newfile->write(newfile->state, new, (size_t)newsize) != BSDIFF_SUCCESS) ||
+		(newfile->flush(newfile->state) != BSDIFF_SUCCESS))
+	{
+		HANDLE_ERROR(BSDIFF_FILE_ERROR, "write newfile");
 	}
 
-	/* Check for appropriate magic */
-	if (memcmp(header, "ENDSLEY/BSDIFF43", 16) != 0)
-		errx(1, "Corrupt patch\n");
+	ret = BSDIFF_SUCCESS;
 
-	/* Read lengths from header */
-	newsize=offtin(header+16);
-	if(newsize<0)
-		errx(1,"Corrupt patch\n");
+cleanup:
+	if (new != NULL) { free(new); }
+	if (old != NULL) { free(old); }
 
-	/* Close patch file and re-open it via libbzip2 at the right places */
-	if(((fd=open(argv[1],O_RDONLY,0))<0) ||
-		((oldsize=lseek(fd,0,SEEK_END))==-1) ||
-		((old=malloc(oldsize+1))==NULL) ||
-		(lseek(fd,0,SEEK_SET)!=0) ||
-		(read(fd,old,oldsize)!=oldsize) ||
-		(fstat(fd, &sb)) ||
-		(close(fd)==-1)) err(1,"%s",argv[1]);
-	if((new=malloc(newsize+1))==NULL) err(1,NULL);
-
-	if (NULL == (bz2 = BZ2_bzReadOpen(&bz2err, f, 0, 0, NULL, 0)))
-		errx(1, "BZ2_bzReadOpen, bz2err=%d", bz2err);
-
-	stream.read = bz2_read;
-	stream.opaque = bz2;
-	if (bspatch(old, oldsize, new, newsize, &stream))
-		errx(1, "bspatch");
-
-	/* Clean up the bzip2 reads */
-	BZ2_bzReadClose(&bz2err, bz2);
-	fclose(f);
-
-	/* Write the new file */
-	if(((fd=open(argv[2],O_CREAT|O_TRUNC|O_WRONLY,sb.st_mode))<0) ||
-		(write(fd,new,newsize)!=newsize) || (close(fd)==-1))
-		err(1,"%s",argv[2]);
-
-	free(new);
-	free(old);
-
-	return 0;
+	return ret;
 }
-
-#endif

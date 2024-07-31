@@ -1,4 +1,4 @@
-/*-
+﻿/*-
  * Copyright 2003-2005 Colin Percival
  * Copyright 2021 zhuyie
  * All rights reserved
